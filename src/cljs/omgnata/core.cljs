@@ -13,16 +13,22 @@
 
 (enable-console-print!)
 
-(def server (atom {:url (str (.replace (-> js/document .-location .-href) ":3449" ":8000") "server.php")
+(def href (-> js/document .-location .-href))
+
+(def server (atom {:url (str (-> href
+                                 (.split "#") (get 0)
+                                 (.split "?") (get 0)
+                                 (.replace ":3449" ":8000")) "server.php")
                    :poller-time 5}))
 
 (secretary/set-config! :prefix "#")
 
-(defonce instance (atom 0))
+(defonce poller-instance (atom 0))
 (defonce todo-lists (atom {}))
 (defonce todo-timestamps (atom {}))
-(defonce last-timestamp (atom 0))
+(defonce last-timestamp (atom (if (not= (.indexOf href "?demo") -1) 0)))
 (defonce sorter (atom nil))
+(defonce app-has-focus (atom true))
 
 (def re-todo-finder #"[\ \t]*\*[\ \t]*\[(.*?)\]")
 (def re-todo-parser #"[\ \t]*\*[\ \t]*\[(.*?)\][\ \t]*(.*?)[\n$]([\s\S]*)")
@@ -146,7 +152,7 @@
     (ajax-request {:uri (@server :url)
                    :method :get
                    :with-credentials true
-                   :params {:timestamp timestamp
+                   :params {:timestamp (or timestamp 0)
                             :live_for (@server :poller-time)}
                    :response-format (json-response-format)
                    :handler #(put! c %)})
@@ -186,34 +192,35 @@
 (defn long-poller [todos file-timestamps instance-id]
   "Continuously poll the server updating the todos atom when the textfile data changes."
   (go (loop [wait 1000]
-        (print "Long poller initiated:" instance-id "timestamp:" @last-timestamp)
-        ; don't fire off more than 1 time per second
-        (let [[ok result] (<! (get-files @last-timestamp))]
-          ; if we have fired off a new instance don't use this one
-          (when (= instance-id @instance)
+        ; if we have fired off a new instance don't use this one
+        (when (= instance-id @poller-instance)
+          (print "Long poller initiated:" instance-id "timestamp:" @last-timestamp)
+          ; don't fire off more than 1 time per second
+          (let [[ok result] (if @app-has-focus (<! (get-files @last-timestamp)) [false {:failure "App lost focus. Skipping poll."}])]
             (js/console.log "Long-poller result:" (clj->js result))
-            (let [new-wait
-                  (or (if (result :failure)
-                        (do (js/console.log "Long-poller ignoring bad data.") nil)
-                        (do (if (>= (result "timestamp") @last-timestamp)
-                              (do
-                                (js/console.log "Long-poller new timestamp.")
-                                (reset! last-timestamp (result "timestamp"))
-                                (when (not ok)
-                                  ; this happens with the poller timeout so we can't use it d'oh
-                                  )
-                                (let [transformed-todos (transform-text-todos (result "files"))
-                                      timestamps (into {} (map (fn [[fname timestamp]] [(no-extension fname) timestamp]) (result "creation_timestamps")))]
-                                  (when (and ok (not (= @file-timestamps timestamps)) timestamps (> (count timestamps) 0))
-                                    (js/console.log "Long-poller creation timestamps:" (clj->js timestamps))
-                                    (reset! file-timestamps timestamps))
-                                  (when (and ok (result "files") (not (= @todos transformed-todos)))
-                                    (js/console.log "long-poller result:" @last-timestamp ok (clj->js result))
-                                    (reset! todos transformed-todos))))
-                              (js/console.log "Long-poller ignoring old data:" (clj->js result)))
-                            ; reset wait time
-                            1000))
-                      (min (* wait 2) 120000))]
+            (let [new-wait (if @app-has-focus
+                             (or (if (result :failure)
+                                   (do (js/console.log "Long-poller ignoring bad data.") nil)
+                                   (do (if (>= (result "timestamp") @last-timestamp)
+                                         (do
+                                           (js/console.log "Long-poller new timestamp.")
+                                           (reset! last-timestamp (result "timestamp"))
+                                           (when (not ok)
+                                             ; this happens with the poller timeout so we can't use it d'oh
+                                             )
+                                           (let [transformed-todos (transform-text-todos (result "files"))
+                                                 timestamps (into {} (map (fn [[fname timestamp]] [(no-extension fname) timestamp]) (result "creation_timestamps")))]
+                                             (when (and ok (not (= @file-timestamps timestamps)) timestamps (> (count timestamps) 0))
+                                               (js/console.log "Long-poller creation timestamps:" (clj->js timestamps))
+                                               (reset! file-timestamps timestamps))
+                                             (when (and ok (result "files") (not (= @todos transformed-todos)))
+                                               (js/console.log "long-poller result:" @last-timestamp ok (clj->js result))
+                                               (reset! todos transformed-todos))))
+                                         (js/console.log "Long-poller ignoring old data:" (clj->js result)))
+                                       ; reset wait time
+                                       1000))
+                                 (min (* wait 2) 120000))
+                             2000)]
               (js/console.log "Long-poller timeout wait:" new-wait)
               (<! (timeout new-wait))
               (recur new-wait)))))))
@@ -325,6 +332,7 @@
   [(with-focus-wrapper)
    (fn []
      [:textarea.edit-item-text {:value @item-title
+                                :placeholder "Item..."
                                 :on-change #(reset! item-title (-> % .-target .-value))
                                 :on-key-down (fn [ev] (when (= (.-which ev) 13) (item-done-fn ev) (.preventDefault ev)))
                                 :on-blur (fn [ev] 
@@ -336,6 +344,7 @@
      (fn []
        [:textarea.add-item-text {:auto-focus true
                                  :value @item-title
+                                 :placeholder "Item..."
                                  :on-change #(reset! item-title (-> % .-target .-value))
                                  :on-key-down (fn [ev] (when (= (.-which ev) 13) (item-done-fn ev) (.preventDefault ev)))}])
      {:component-did-update (fn [this]
@@ -356,19 +365,17 @@
           [:i.btn.update-item-done {:on-click item-update-fn :class "fa fa-check-circle"}]]
          [:span {}
           (when @parent-add-mode [:span
-                                  [:i.handle.btn {:class "fa fa-sort"}] 
-                                  [:i.btn.delete-item {:on-click (partial delete-item-handler todos filename todo) :class "fa fa-minus-circle"}]]) 
+                                  [:i.btn.delete-item {:on-click (partial delete-item-handler todos filename todo) :class "fa fa-minus-circle"}]
+                                  [:span.btn.handle.fa-stack [:i {:class "fa fa-circle fa-stack-2x"}] [:i {:class "fa fa-bars fa-stack-1x fa-inverse"}]]])
           [:i.checkbox.btn {:on-click (partial checkbox-handler todos filename todo) :class (if (todo :checked) "fa fa-check-circle" "fa fa-circle")}] 
           [:div.todo-text {:on-double-click #(swap! edit-mode not)} (todo :title)]])])))
 
 (defn component-list-of-todos [todos filename add-mode]
   [(with-meta
      (fn []
-       (if (> (count @todos) 0)
-         [:ul {:key filename}
-          (doall (map-indexed (fn [idx todo] ^{:key (todo :index)} [(partial component-todo-item todos filename todo) idx todo add-mode])
-                              (filter :matched (@todos filename))))]
-         [:div#loader [:div]]))
+       [:ul {:key filename}
+        (doall (map-indexed (fn [idx todo] ^{:key (todo :index)} [(partial component-todo-item todos filename todo) idx todo add-mode])
+                            (filter :matched (@todos filename))))])
      {:component-did-mount (partial apply-sortable todos filename)
       :component-did-update (partial apply-sortable todos filename)})])
 
@@ -377,45 +384,55 @@
         new-item-title (atom "")
         item-done-fn (partial add-todo-item-handler todos filename new-item-title add-mode)]
     (fn []
-      [:div.todo-page
-       [:i#back.btn {:on-click go-home :class "fa fa-chevron-circle-left"}]
-       [:h3.list-title filename]
-       [:span#add-item.btn {:on-click #(swap! add-mode not) :class "fa fa-stack"}
-        [:i {:class "fa fa-stack-2x fa-circle"}]
-        (if @add-mode [:i {:class "fa fa-stack-1x fa-times fa-inverse"}] [:i {:class "fa fa-stack-1x fa-pencil fa-inverse"}])]
-       (when (and @add-mode (> (count (filter :checked (@todos filename))) 0))
-         [:i#clear-completed.btn {:on-click (partial delete-completed-handler todos filename) :class "fa fa-minus-circle"}])
-       (when @add-mode
-         [:div#add-item-container
-          [component-item-add new-item-title add-mode item-done-fn]
-          [:i#add-item-done.btn {:on-click item-done-fn :class "fa fa-check-circle"}]])
-       [component-list-of-todos todos filename add-mode]])))
+      (if (nil? @last-timestamp)
+        [:div#loader [:div]]
+        [:div.todo-page
+         [:i#back.btn {:on-click go-home :class "fa fa-chevron-circle-left"}]
+         [:h3.list-title filename]
+         [:span#add-item.btn {:on-click #(swap! add-mode not) :class "fa fa-stack"}
+          [:i {:class "fa fa-stack-2x fa-circle"}]
+          (if @add-mode [:i {:class "fa fa-stack-1x fa-times fa-inverse"}] [:i {:class "fa fa-stack-1x fa-pencil fa-inverse"}])]
+         (when (and @add-mode (> (count (filter :checked (@todos filename))) 0))
+           [:i#clear-completed.btn {:on-click (partial delete-completed-handler todos filename) :class "fa fa-minus-circle"}])
+         (when @add-mode
+           [:div#add-item-container
+            [component-item-add new-item-title add-mode item-done-fn]
+            [:i#add-item-done.btn {:on-click item-done-fn :class "fa fa-check-circle"}]])
+         (when (and (= (count (@todos filename)) 0) (not @add-mode))
+           [:div.message
+            [:p "Use the pencil icon to add a list item."]])
+         [component-list-of-todos todos filename add-mode]]))))
 
 (defn lists-page [todos timestamps]
   (let [add-mode (atom false)
         new-item (atom "")
         update-fn (partial add-todo-list-handler todos new-item add-mode)]
     (fn []
-      [:div
-       [:div#list-edit-container
-        [:span#add-list.btn {:on-click #(swap! add-mode not) :class "fa fa-stack"}
-         [:i {:class "fa fa-stack-2x fa-circle"}]
-         (if @add-mode [:i {:class "fa fa-stack-1x fa-times fa-inverse"}] [:i {:class "fa fa-stack-1x fa-pencil fa-inverse"}])]
-        (when @add-mode
-          [:div#add-item-container
-           [:input {:auto-focus true :on-change #(reset! new-item (-> % .-target .-value)) :on-key-down #(if (= (.-which %) 13) (update-fn %)) :value @new-item}]
-           [:i#add-item-done.btn {:on-click update-fn :class "fa fa-check-circle"}]])]
-       [:ul {}
-        (if (count @todos)
-          (doall (map-indexed (fn [idx [filename todo-list]]
-                                (let [fname (no-extension filename)]
-                                  [:li.todo-link {:key filename :class (str "oddeven-" (mod idx 2))}
-                                   (if @add-mode [:i.delete-list.btn {:on-click (partial delete-todo-list-handler todos filename add-mode) :class "fa fa-minus-circle"}])
-                                   [:span.unchecked-count (count (filter #(= (% :checked) false) todo-list))]
-                                   [:span {:on-click (partial switch-to-todo fname)} fname]]))
-                              ; sort by the creation time timestamps the server has sent, defaulting to infinity (for newly created files)
-                              (sort #(compare (or (@timestamps (first %2)) js/Number.MAX_VALUE) (or (@timestamps (first %1)) js/Number.MAX_VALUE)) @todos)))
-          [:li "No TODOs yet."])]])))
+      (if (nil? @last-timestamp)
+        [:div#loader [:div]]
+        [:div
+         [:div#list-edit-container
+          [:span#add-list.btn {:on-click #(swap! add-mode not) :class "fa fa-stack"}
+           [:i {:class "fa fa-stack-2x fa-circle"}]
+           (if @add-mode [:i {:class "fa fa-stack-1x fa-times fa-inverse"}] [:i {:class "fa fa-stack-1x fa-pencil fa-inverse"}])]
+          (when @add-mode
+            [:div#add-item-container
+             [:input {:auto-focus true :on-change #(reset! new-item (-> % .-target .-value)) :on-key-down #(if (= (.-which %) 13) (update-fn %)) :value @new-item :placeholder "List name..."}]
+             [:i#add-item-done.btn {:on-click update-fn :class "fa fa-check-circle"}]])]
+         [:ul {}
+          (if (> (count @todos) 0)
+            (doall (map-indexed (fn [idx [filename todo-list]]
+                                  (let [fname (no-extension filename)]
+                                    [:li.todo-link {:key filename :class (str "oddeven-" (mod idx 2))}
+                                     (if @add-mode [:i.delete-list.btn {:on-click (partial delete-todo-list-handler todos filename add-mode) :class "fa fa-minus-circle"}])
+                                     [:span.unchecked-count (count (filter #(= (% :checked) false) todo-list))]
+                                     [:span {:on-click (partial switch-to-todo fname)} fname]]))
+                                ; sort by the creation time timestamps the server has sent, defaulting to infinity (for newly created files)
+                                (sort #(compare (or (@timestamps (first %2)) js/Number.MAX_VALUE) (or (@timestamps (first %1)) js/Number.MAX_VALUE)) @todos)))
+            (when (not @add-mode)
+              [:li.message
+               [:p "You don't have any TODO lists yet."]
+               [:p "You can create lists like 'Shopping' or 'Work' using the pencil icon."]]))]]))))
 
 (defn current-page []
   [:div [(session/get :current-page)]])
@@ -424,13 +441,13 @@
 ;; Routes
 
 (secretary/defroute "/" []
-  (session/put! :current-page (lists-page todo-lists todo-timestamps)))
+  (session/put! :current-page (partial #'lists-page todo-lists todo-timestamps)))
 
 (secretary/defroute "/:fname" [fname]
-  (session/put! :current-page (todo-page todo-lists fname)))
+  (session/put! :current-page (partial #'todo-page todo-lists fname)))
 
 ;; -------------------------
-;; History
+;; Hooks
 
 ;; Quick and dirty history configuration.
 (defn hook-browser-navigation! []
@@ -438,11 +455,15 @@
     (goog.events/listen h EventType/NAVIGATE #(secretary/dispatch! (.-token %)))
     (doto h (.setEnabled true))))
 
+(defn hook-focus-watcher! [f]
+  (.addEventListener js/window "blur" #(reset! f false) false)
+  (.addEventListener js/window "focus" #(reset! f true) false))
+
 ;; -------------------------
 ;; Initialize app
 
 ; initiate the long-poller
-(long-poller todo-lists todo-timestamps (swap! instance inc))
+(long-poller todo-lists todo-timestamps (swap! poller-instance inc))
 
 ; tell react to handle touch events
 (.initializeTouchEvents js/React true)
@@ -457,4 +478,5 @@
            :poller-time 30)
     (js/console.log "dev mode"))
   (hook-browser-navigation!)
+  (hook-focus-watcher! app-has-focus)
   (mount-root))
